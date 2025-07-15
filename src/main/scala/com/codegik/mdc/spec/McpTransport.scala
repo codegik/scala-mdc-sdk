@@ -1,6 +1,5 @@
 package com.codegik.mdc.spec
 
-import com.codegik.mdc.client.McpStream
 import scala.concurrent.Future
 import scala.concurrent.duration.Duration
 
@@ -43,7 +42,7 @@ trait McpClientTransport extends McpTransport {
    * @param payload The request payload
    * @return A stream of responses
    */
-  def stream(session: McpTransportSession, payload: String): McpStream[String]
+  def stream(session: McpTransportSession, payload: String): LazyList[String]
 
   /**
    * Closes the transport.

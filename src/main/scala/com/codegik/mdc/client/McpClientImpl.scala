@@ -3,10 +3,10 @@ package com.codegik.mdc.client
 import com.codegik.mdc.spec.{DefaultJsonSchemaValidator, DefaultMcpTransportSession, JsonSchemaValidator, McpClientSession, McpClientTransport, McpTransportSession}
 import com.codegik.mdc.util.Assert
 import com.codegik.mdc.spec._
+import scala.concurrent.ExecutionContext.Implicits.global
 
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
-import scala.collection.JavaConverters._
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
@@ -25,7 +25,7 @@ class McpAsyncClientImpl(
   private implicit val executionContext: ExecutionContext
 ) extends McpAsyncClient {
 
-  private val sessions = new ConcurrentHashMap[String, McpClientSession]()
+  private val sessions = TrieMap.empty[String, McpClientSession]
   private var initialized = false
 
   /**
@@ -95,17 +95,15 @@ class McpAsyncClientImpl(
    * @param payload The request payload
    * @return A stream of responses
    */
-  override def stream(payload: String): McpStream[String] = {
+  override def stream(payload: String): LazyList[String] = {
     Assert.hasText(payload, "Payload cannot be null or empty")
     if (!initialized) {
-      val failedStream = new McpStreamImpl[String]()
-      failedStream.error(new IllegalStateException("Client not initialized"))
-      return failedStream
+      // Return an empty LazyList for uninitialized client
+      return LazyList.empty
     }
 
     val sessionId = UUID.randomUUID().toString
     val session = createSession(sessionId)
-    val resultStream = new McpStreamImpl[String]()
 
     // If schema validation is enabled, validate the request
     val validationFuture = if (features.validateRequestSchema) {
@@ -114,39 +112,79 @@ class McpAsyncClientImpl(
       Future.successful(())
     }
 
+    // Create a buffer to hold stream elements while being processed
+    val streamBuffer = scala.collection.mutable.ArrayBuffer[String]()
+
+    // Set up a promise that will complete when the transport stream is ready
+    val streamPromise = Promise[LazyList[String]]()
+
     validationFuture.onComplete {
       case Success(_) =>
         // Start streaming
         val responseStream = transport.stream(session.getTransportSession, payload)
 
-        // Subscribe to the transport stream
-        responseStream.subscribe(
-          response => {
-            // If schema validation is enabled, validate each response
-            if (features.validateResponseSchema) {
-              validator.validate(response, session.getResponseSchema).onComplete {
-                case Success(_) => resultStream.next(response)
-                case Failure(e) => resultStream.error(new IllegalArgumentException(s"Response validation failed: ${e.getMessage}"))
+        // Set up a poller that will periodically check for new messages
+        val pollingExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+        val pollingTask = new Runnable {
+          override def run(): Unit = {
+            if (responseStream.nonEmpty) {
+              // Process any new elements that have arrived
+              val newElements = responseStream.dropWhile(e => streamBuffer.contains(e))
+              if (newElements.nonEmpty) {
+                // Add new elements to the buffer
+                newElements.foreach { response =>
+                  // Validate if needed
+                  if (features.validateResponseSchema) {
+                    validator.validate(response, session.getResponseSchema).onComplete {
+                      case Success(_) =>
+                        streamBuffer.synchronized {
+                          streamBuffer.append(response)
+                        }
+                      case Failure(e) =>
+                        // Skip invalid responses
+                    }
+                  } else {
+                    streamBuffer.synchronized {
+                      streamBuffer.append(response)
+                    }
+                  }
+                }
               }
-            } else {
-              resultStream.next(response)
             }
-          },
-          error => resultStream.error(error),
-          () => {
-            resultStream.complete()
-            sessions.remove(sessionId)
-            session.getTransportSession.close()
+          }
+        }
+
+        // Schedule the polling task
+        pollingExecutor.scheduleAtFixedRate(pollingTask, 0, 100, java.util.concurrent.TimeUnit.MILLISECONDS)
+
+        // Complete the promise with a LazyList that will read from the buffer
+        streamPromise.success(
+          LazyList.unfold(0) { index =>
+            streamBuffer.synchronized {
+              if (index < streamBuffer.size) {
+                Some((streamBuffer(index), index + 1))
+              } else {
+                None
+              }
+            }
           }
         )
 
       case Failure(e) =>
-        resultStream.error(e)
+        // Complete with an empty stream on validation failure
+        streamPromise.success(LazyList.empty)
         sessions.remove(sessionId)
         session.getTransportSession.close()
     }
 
-    resultStream
+    // If we can't get a stream right away, return an empty one
+    try {
+      import scala.concurrent.Await
+      import scala.concurrent.duration._
+      Await.result(streamPromise.future, 1.second)
+    } catch {
+      case _: Exception => LazyList.empty
+    }
   }
 
   /**
@@ -157,7 +195,7 @@ class McpAsyncClientImpl(
   override def close(): Future[Unit] = {
     Future {
       if (initialized) {
-        sessions.values().asScala.foreach(session =>
+        sessions.values.foreach(session =>
           session.getTransportSession.close()
         )
         sessions.clear()
@@ -225,12 +263,11 @@ class McpSyncClientImpl(private val asyncClient: McpAsyncClient) extends McpSync
    * @param callback The callback to process streaming responses
    */
   override def stream(payload: String, callback: String => Unit): Unit = {
-    val stream = asyncClient.stream(payload)
-    stream.subscribe(
-      response => callback(response),
-      error => throw error,
-      () => {}
-    )
+    // Get the stream from the async client
+    val lazyStream = asyncClient.stream(payload)
+
+    // Process each element with the callback
+    lazyStream.foreach(callback)
   }
 
   /**

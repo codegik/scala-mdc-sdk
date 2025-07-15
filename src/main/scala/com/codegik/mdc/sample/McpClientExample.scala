@@ -1,6 +1,6 @@
 package com.codegik.mdc.sample
 
-import com.codegik.mdc.client.{McpAsyncClient, McpClientFeatures, McpStream}
+import com.codegik.mdc.client.{McpAsyncClient, McpClientFeatures}
 import com.codegik.mdc.client.transport.StdioClientTransport
 
 import scala.concurrent.{Await, Future, Promise}
@@ -100,23 +100,29 @@ object McpClientExample {
     // Start streaming
     val stream = client.stream(request)
 
-    // Subscribe to the stream
-    stream.subscribe(
-      // Handle each chunk of the response
-      response => println(s"Received chunk: $response"),
+    // Process the stream elements in a separate Future
+    Future {
+      try {
+        // If the stream is empty, it might mean there was an error
+        if (stream.isEmpty) {
+          println("Stream was empty or failed to initialize")
+          streamCompleted.trySuccess(())
+        } else {
+          // Process each element as it becomes available
+          stream.foreach { response =>
+            println(s"Received chunk: $response")
+          }
 
-      // Handle errors
-      error => {
-        println(s"Stream error: ${error.getMessage}")
-        streamCompleted.failure(error)
-      },
-
-      // Handle completion
-      () => {
-        println("Stream completed")
-        streamCompleted.success(())
+          // After processing all elements, mark as complete
+          println("Stream processing finished")
+          streamCompleted.trySuccess(())
+        }
+      } catch {
+        case e: Exception =>
+          println(s"Stream processing error: ${e.getMessage}")
+          streamCompleted.tryFailure(e)
       }
-    )
+    }
 
     // Wait for the stream to complete
     println("Waiting for stream to complete...")

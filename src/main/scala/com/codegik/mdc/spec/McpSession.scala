@@ -1,6 +1,5 @@
 package com.codegik.mdc.spec
 
-import com.codegik.mdc.client.McpStream
 import scala.concurrent.Future
 
 /**
@@ -34,7 +33,7 @@ trait McpTransportSession {
    *
    * @return A stream of incoming messages
    */
-  def getIncomingMessages: McpStream[String]
+  def getIncomingMessages: LazyList[String]
 }
 
 /**

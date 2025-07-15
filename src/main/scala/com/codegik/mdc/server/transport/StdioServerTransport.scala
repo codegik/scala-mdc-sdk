@@ -1,6 +1,5 @@
 package com.codegik.mdc.server.transport
 
-import com.codegik.mdc.client.McpStreamImpl
 import com.codegik.mdc.spec.{DefaultMcpTransportSession, McpServerTransport, McpServerTransportProvider, McpTransportSession, McpTransportSessionNotFoundException}
 
 import java.io.{BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter}

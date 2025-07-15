@@ -39,7 +39,7 @@ trait McpAsyncClient extends McpClient {
    * @param payload The request payload
    * @return A stream of responses
    */
-  def stream(payload: String): McpStream[String]
+  def stream(payload: String): LazyList[String]
 }
 
 /**

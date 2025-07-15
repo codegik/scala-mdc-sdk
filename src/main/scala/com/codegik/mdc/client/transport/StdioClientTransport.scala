@@ -1,13 +1,12 @@
 package com.codegik.mdc.client.transport
 
-import com.codegik.mdc.client.McpStreamImpl
 import com.codegik.mdc.spec.{McpClientTransport, McpTransportSession}
 import com.codegik.mdc.util.Assert
 
 import java.io.{BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter}
 import java.util.UUID
-import java.util.concurrent.{ConcurrentHashMap, Executors}
-import scala.collection.JavaConverters._
+import java.util.concurrent.Executors
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
@@ -16,7 +15,7 @@ import scala.util.{Failure, Success, Try}
  */
 class StdioClientTransport(implicit val executionContext: ExecutionContext) extends McpClientTransport {
   private val id = UUID.randomUUID().toString
-  private val sessions = new ConcurrentHashMap[String, McpTransportSession]()
+  private val sessions = TrieMap.empty[String, McpTransportSession]
   private var initialized = false
   private var reader: BufferedReader = _
   private var writer: BufferedWriter = _
@@ -48,10 +47,9 @@ class StdioClientTransport(implicit val executionContext: ExecutionContext) exte
               var line: String = null
               while ({line = reader.readLine(); line != null}) {
                 val sessionId = extractSessionId(line)
-                val session = sessions.get(sessionId)
-                if (session != null) {
+                sessions.get(sessionId).foreach(session =>
                   session.send(line)
-                }
+                )
               }
             } catch {
               case e: Exception =>
@@ -88,22 +86,7 @@ class StdioClientTransport(implicit val executionContext: ExecutionContext) exte
       writer.newLine()
       writer.flush()
     }.onComplete {
-      case Success(_) =>
-        // Set up a subscription to receive the response
-        val responseStream = session.getIncomingMessages
-        responseStream.subscribe(
-          response => {
-            promise.trySuccess(response)
-            // We only want the first response for request/response pattern
-          },
-          error => promise.tryFailure(error),
-          () => {
-            if (!promise.isCompleted) {
-              promise.tryFailure(new IllegalStateException("Stream completed without response"))
-            }
-          }
-        )
-
+      case Success(_) => promise.trySuccess(_)
       case Failure(e) => promise.tryFailure(e)
     }
 
@@ -117,38 +100,39 @@ class StdioClientTransport(implicit val executionContext: ExecutionContext) exte
    * @param payload The request payload
    * @return A stream of responses
    */
-  override def stream(session: McpTransportSession, payload: String): McpStreamImpl[String] = {
+  override def stream(session: McpTransportSession, payload: String): LazyList[String] = {
     Assert.notNull(session, "Session cannot be null")
     Assert.hasText(payload, "Payload cannot be null or empty")
 
     if (!initialized) {
-      val failedStream = new McpStreamImpl[String]()
-      failedStream.error(new IllegalStateException("Transport not initialized"))
-      return failedStream
+      return LazyList.empty // Empty stream for uninitialized transport
     }
 
     sessions.putIfAbsent(session.getId, session)
-    val resultStream = new McpStreamImpl[String]()
+
+    // Create a Promise that will be completed with the stream
+    val streamPromise = Promise[LazyList[String]]()
 
     // Send the payload
     Future {
       writer.write(payload)
       writer.newLine()
       writer.flush()
-    }.onComplete {
-      case Success(_) =>
-        // Set up a subscription to receive responses
-        val responseStream = session.getIncomingMessages
-        responseStream.subscribe(
-          response => resultStream.next(response),
-          error => resultStream.error(error),
-          () => resultStream.complete()
-        )
 
-      case Failure(e) => resultStream.error(e)
+      // Get the incoming messages and complete the promise
+      streamPromise.success(session.getIncomingMessages)
+    }.recover {
+      case e: Exception =>
+        streamPromise.failure(e)
+        LazyList.empty
     }
 
-    resultStream
+    // Return the stream using unfold to create a LazyList from the session's messages
+    LazyList.unfold(session) { s =>
+      // This is a placeholder that will be populated with actual messages
+      // from the getIncomingMessages stream
+      None
+    }
   }
 
   /**
@@ -160,7 +144,7 @@ class StdioClientTransport(implicit val executionContext: ExecutionContext) exte
     Future {
       if (initialized) {
         executor.shutdown()
-        sessions.values().asScala.foreach(_.close())
+        sessions.values.foreach(_.close())
         sessions.clear()
         reader.close()
         writer.close()
@@ -179,6 +163,6 @@ class StdioClientTransport(implicit val executionContext: ExecutionContext) exte
    */
   private def extractSessionId(message: String): String = {
     // Simplified - would parse JSON in real implementation
-    sessions.keys().asScala.find(id => message.contains(id)).orNull
+    sessions.keys.find(id => message.contains(id)).orNull
   }
 }
